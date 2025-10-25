@@ -1,135 +1,356 @@
+/**
+ * testbot.js
+ *
+ * Repeatable site tester (for domains you own)
+ *
+ * Behavior summary (defaults):
+ * - random 2..7 tabs per run (use --fixed-instances to set exact)
+ * - open referrer URL -> wait 1..2 min with micro-actions -> click a link to target (if present)
+ * - on target homepage: partial/random scroll + wait 1..4.5 min
+ * - click a random internal post (same hostname) -> partial/random scroll + wait 1..4.5 min
+ * - repeats for --runs (or forever with --forever) with --interval between runs
+ * - logs sessions to sessions_log.csv
+ *
+ * Usage:
+ *   npm i puppeteer-extra puppeteer-extra-plugin-stealth puppeteer
+ *   node testbot.js <target_url> <referrer_url> [options] --confirm-owned
+ *
+ * Example:
+ *   node testbot.js https://learnwithblog.xyz https://x.com/GhostReacondev/status/1981679871513575623 \
+ *     --runs=5 --interval=30000 --confirm-owned
+ *
+ * IMPORTANT: Only run on domains you OWN or have explicit written permission to test.
+ */
+
 const puppeteer = require('puppeteer-extra');
 const fs = require('fs');
+const path = require('path');
 puppeteer.use(require('puppeteer-extra-plugin-stealth')());
 
-function randomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-function randint(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+/* ---------- helpers ---------- */
+function rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 const UA_LIST = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/121.0.0.0 Mobile/15E148 Safari/604.1'
 ];
 
-const viewports = [
+const VIEWPORTS = [
   { width: 1366, height: 768 },
   { width: 1440, height: 900 },
   { width: 412, height: 915 },
   { width: 390, height: 844 },
+  { width: 1024, height: 768 },
 ];
 
-async function humanMoveMouse(page, moves = randint(8, 28)) {
-  const vw = page.viewport();
-  for (let i = 0; i < moves; i++) {
-    const x = randint(10, (vw.width || 800) - 10);
-    const y = randint(10, (vw.height || 600) - 10);
-    await page.mouse.move(x, y, { steps: randint(8, 30) });
-    await page.waitForTimeout(randomDelay(60, 320));
-  }
-}
-
-async function humanScrollPattern(page) {
-  const fullHeight = await page.evaluate(() => document.body.scrollHeight || document.documentElement.scrollHeight).catch(()=>0);
-  const viewport = page.viewport();
-  const passes = randint(2, 5);
-  for (let p = 0; p < passes; p++) {
-    const maxScroll = Math.min(fullHeight || (viewport.height || 800) * randint(1, 3), (viewport.height || 800) * randint(1,3));
-    const step = randint(Math.max(100, Math.floor((viewport.height || 800) / 6)), Math.floor((viewport.height || 800) / 2));
-    let cur = 0;
-    while (cur < maxScroll) {
-      await page.evaluate(y => window.scrollBy(0, y), step).catch(()=>{});
-      cur += step;
-      await page.waitForTimeout(randomDelay(500, 1800));
-      if (Math.random() < 0.07) {
-        await page.evaluate(y => window.scrollBy(0, -y), randint(20, 100)).catch(()=>{});
-      }
-    }
-    await page.waitForTimeout(randomDelay(700, 2000));
-  }
-}
-
-async function waitOnReferrer(page) {
-  const waitTime = randomDelay(60000, 120000); // 1–2 minutes
-  const start = Date.now();
-  while (Date.now() - start < waitTime) {
-    await humanMoveMouse(page, randint(3,10));
-    await page.evaluate(() => window.scrollBy(0, Math.floor(Math.random()*100)-50)).catch(()=>{});
-    await page.waitForTimeout(randomDelay(2000, 6000));
-  }
-}
-
-async function clickLearnWithBlogLink(page) {
-  const clicked = await page.evaluate(() => {
-    const anchors = Array.from(document.querySelectorAll('a[href*="learnwithblog.xyz"]'));
-    if (!anchors.length) return false;
-    const el = anchors[Math.floor(Math.random() * anchors.length)];
-    el.target = '_self';
-    el.click();
-    return true;
-  }).catch(()=>false);
-  return clicked;
-}
-
-async function humanOnTarget(page, targetUrl) {
-  console.log(`👀 On target: ${targetUrl}, simulating human behavior.`);
-  await humanScrollPattern(page);
-  await humanMoveMouse(page, randint(10, 36));
-  
-  if (Math.random() < 0.35) {
-    try {
-      const input = await page.$('input[type="search"], input[placeholder], input[name*="q"], textarea').catch(()=>null);
-      if (input) {
-        const txt = ['test', 'hello', 'puppeteer', 'query'][Math.floor(Math.random()*4)];
-        await input.click({ clickCount: 1 }).catch(()=>{});
-        for (const ch of txt) {
-          await page.keyboard.type(ch);
-          await page.waitForTimeout(randomDelay(80, 220));
-        }
-        if (Math.random() < 0.5) { await page.keyboard.press('Enter').catch(()=>{}); await page.waitForTimeout(randomDelay(800, 2500)); }
-      }
-    } catch(_) {}
-  }
-
-  // Final wait: 2–5 minutes
-  const totalWait = randomDelay(120000, 300000);
-  const start = Date.now();
-  while (Date.now() - start < totalWait) {
-    const chunk = Math.min(randomDelay(5000, 20000), totalWait - (Date.now() - start));
-    await page.waitForTimeout(chunk);
-    if (Math.random() < 0.5) await humanMoveMouse(page, randint(3, 12));
-    if (Math.random() < 0.25) await page.evaluate(() => window.scrollBy(0, Math.floor((Math.random()*200)-100))).catch(()=>{});
-  }
-  console.log(`✅ Finished human-like session (~${Math.round(totalWait/1000)}s).`);
-}
-
-(async () => {
-  const tweetUrl = 'https://x.com/GhostReacondev/status/1981679871513575623';
-  const targetUrl = 'https://learnwithblog.xyz';
-  const browser = await puppeteer.launch({
+/* ---------- CLI parsing ---------- */
+function parseArgs() {
+  const argv = process.argv.slice(2);
+  const cfg = {
+    target: null,
+    referrer: null,
+    runs: 1,
+    forever: false,
+    interval: 10000,       // ms between runs
+    minRefWait: 60000,     // 1 min
+    maxRefWait: 120000,    // 2 min
+    minTargetWait: 60000,  // 1 min
+    maxTargetWait: 270000, // 4.5 min
+    minTabs: 2,
+    maxTabs: 7,
+    fixedInstances: null,  // if set, use this exact number instead of random 2..7
+    confirmOwned: false,
     headless: false,
-    args: ['--no-sandbox','--disable-setuid-sandbox']
-  });
-  const page = await browser.newPage();
-  await page.setUserAgent(UA_LIST[randint(0, UA_LIST.length-1)]);
-  const vp = viewports[randint(0, viewports.length-1)];
-  await page.setViewport({ width: vp.width, height: vp.height });
-  await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+    debug: false,
+    screenshot: false
+  };
 
-  console.log('🚀 Opening tweet...');
-  await page.goto(tweetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-  console.log('⏳ Waiting 1–2 minutes on the tweet...');
-  await waitOnReferrer(page);
-
-  console.log('🔗 Clicking LearnWithBlog.xyz link...');
-  const clicked = await clickLearnWithBlogLink(page);
-  if (!clicked) {
-    console.log('❌ Could not find LearnWithBlog.xyz link on tweet, navigating directly.');
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  for (const a of argv) {
+    if (!cfg.target && !a.startsWith('--')) cfg.target = a;
+    else if (!cfg.referrer && !a.startsWith('--')) cfg.referrer = a;
+    else if (a.startsWith('--runs=')) cfg.runs = Math.max(1, parseInt(a.split('=')[1])||1);
+    else if (a === '--forever') cfg.forever = true;
+    else if (a.startsWith('--interval=')) cfg.interval = Math.max(0, parseInt(a.split('=')[1])||cfg.interval);
+    else if (a.startsWith('--min-ref-wait=')) cfg.minRefWait = Math.max(1000, parseInt(a.split('=')[1])||cfg.minRefWait);
+    else if (a.startsWith('--max-ref-wait=')) cfg.maxRefWait = Math.max(cfg.minRefWait, parseInt(a.split('=')[1])||cfg.maxRefWait);
+    else if (a.startsWith('--min-target-wait=')) cfg.minTargetWait = Math.max(1000, parseInt(a.split('=')[1])||cfg.minTargetWait);
+    else if (a.startsWith('--max-target-wait=')) cfg.maxTargetWait = Math.max(cfg.minTargetWait, parseInt(a.split('=')[1])||cfg.maxTargetWait);
+    else if (a.startsWith('--min-tabs=')) cfg.minTabs = Math.max(1, parseInt(a.split('=')[1])||cfg.minTabs);
+    else if (a.startsWith('--max-tabs=')) cfg.maxTabs = Math.max(cfg.minTabs, parseInt(a.split('=')[1])||cfg.maxTabs);
+    else if (a.startsWith('--fixed-instances=')) cfg.fixedInstances = Math.max(1, parseInt(a.split('=')[1])||1);
+    else if (a === '--confirm-owned') cfg.confirmOwned = true;
+    else if (a === '--headless') cfg.headless = true;
+    else if (a === '--debug') cfg.debug = true;
+    else if (a === '--screenshot') cfg.screenshot = true;
   }
 
-  await humanOnTarget(page, targetUrl);
+  return cfg;
+}
 
-  console.log('🎉 Done! Closing browser.');
-  await browser.close();
+/* ---------- human-like micro-actions (light partial scrolls) ---------- */
+async function microMouse(page, moves = 6) {
+  const vw = page.viewport() || { width: 800, height: 600 };
+  for (let i = 0; i < moves; i++) {
+    const x = rand(10, Math.max(10, (vw.width || 800) - 10));
+    const y = rand(10, Math.max(10, (vw.height || 600) - 10));
+    try { await page.mouse.move(x, y, { steps: rand(2, 12) }); } catch(_) {}
+    await sleep(rand(80, 500));
+  }
+}
+
+// partial scroll: only small bursts, never to bottom
+async function partialRandomScroll(page) {
+  const viewport = page.viewport() || { height: 800 };
+  const fullHeight = await page.evaluate(() => {
+    try { return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight); } catch { return 0; }
+  }).catch(()=>0);
+
+  // do a few small scroll bursts up to a fraction of fullHeight
+  const bursts = rand(2, 5);
+  const maxTotal = Math.max( Math.min(fullHeight, viewport.height * rand(1, 2)), viewport.height ); // at most ~2 viewports
+  let scrolled = 0;
+  for (let b = 0; b < bursts && scrolled < maxTotal; b++) {
+    const step = rand(80, Math.floor((viewport.height || 800) / 2));
+    const times = rand(1, 4);
+    for (let t = 0; t < times && scrolled < maxTotal; t++) {
+      await page.evaluate(y => window.scrollBy(0, y), step).catch(()=>{});
+      scrolled += step;
+      await sleep(rand(500, 2000));
+      if (Math.random() < 0.12) await page.evaluate(y => window.scrollBy(0, -y), rand(20, 100)).catch(()=>{});
+    }
+    await sleep(rand(700, 2000));
+  }
+}
+
+/* ---------- flow actions ---------- */
+async function waitOnReferrer(page, minMs, maxMs, debug=false) {
+  const wait = rand(minMs, maxMs);
+  if (debug) console.log(`  debug: referrer wait ~${Math.round(wait/1000)}s`);
+  const start = Date.now();
+  while (Date.now() - start < wait) {
+    await microMouse(page, rand(3, 10));
+    try { await page.evaluate(() => window.scrollBy(0, Math.floor((Math.random()*80)-40))); } catch(_) {}
+    await sleep(rand(2000, 6000));
+  }
+}
+
+async function clickLinkToTarget(page, targetHost, debug=false) {
+  // wait a short time for dynamic content
+  try { await page.waitForTimeout(rand(800, 2500)); } catch(_) {}
+  // try direct anchors
+  const clicked = await page.evaluate((targetHost) => {
+    try {
+      const anchors = Array.from(document.querySelectorAll('a[href]')).filter(a => a.href && a.href.includes(targetHost));
+      if (!anchors.length) return false;
+      const el = anchors[Math.floor(Math.random() * anchors.length)];
+      el.target = '_self';
+      el.click();
+      return true;
+    } catch { return false; }
+  }, targetHost).catch(()=>false);
+
+  if (clicked) { if (debug) console.log('  debug: clicked direct anchor'); return true; }
+
+  // fallback: anchors with text containing host or redirect shorteners
+  const fb = await page.evaluate((targetHost) => {
+    try {
+      const anchors = Array.from(document.querySelectorAll('a[href]')).slice(0, 80);
+      for (const a of anchors) {
+        const href = (a.href||'').toLowerCase();
+        if (href.includes('t.co') || href.includes('bit.ly') || href.includes('tinyurl')) { a.target = '_self'; a.click(); return true; }
+        if ((a.innerText||'').toLowerCase().includes(targetHost.toLowerCase())) { a.target = '_self'; a.click(); return true; }
+      }
+      return false;
+    } catch { return false; }
+  }, targetHost).catch(()=>false);
+
+  if (fb && debug) console.log('  debug: clicked fallback anchor');
+  return !!fb;
+}
+
+async function openRandomInternalPostAndWait(page, targetHost, minWait, maxWait, debug=false) {
+  // find internal links (same hostname), pick random non-root link
+  const href = await page.evaluate((targetHost) => {
+    try {
+      const links = Array.from(document.querySelectorAll('a[href]'))
+        .map(a => a.href)
+        .filter(h => h && h.includes(location.hostname) && h !== location.origin + '/' && !h.endsWith('#') );
+      if (!links.length) return null;
+      return links[Math.floor(Math.random() * links.length)];
+    } catch { return null; }
+  }, targetHost).catch(()=>null);
+
+  if (!href) return { opened: false, finalUrl: await page.url().catch(()=>null) };
+
+  try {
+    await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
+    // partial scroll and wait
+    await partialRandomScroll(page);
+    // wait 1..4.5 min
+    const wait = rand(minWait, maxWait);
+    if (debug) console.log(`  debug: waiting on post ~${Math.round(wait/1000)}s`);
+    const start = Date.now();
+    while (Date.now() - start < wait) {
+      await microMouse(page, rand(3, 10));
+      await sleep(rand(2000, 8000));
+    }
+    return { opened: true, finalUrl: await page.url().catch(()=>href) };
+  } catch (e) {
+    return { opened: false, finalUrl: await page.url().catch(()=>null) };
+  }
+}
+
+/* ---------- logging ---------- */
+function appendCSV(row) {
+  try {
+    const csv = path.join(process.cwd(), 'sessions_log.csv');
+    if (!fs.existsSync(csv)) fs.writeFileSync(csv, 'timestamp,run,tab,referrer_clicked,target_final,post_opened,post_final,duration_ms\n');
+    fs.appendFileSync(csv, row.map(x => `"${String(x||'')}"`).join(',') + '\n');
+  } catch (_) {}
+}
+
+/* ---------- main loop ---------- */
+(async () => {
+  const cfg = parseArgs();
+  if (!cfg.target || !cfg.referrer) {
+    console.error('Usage: node testbot.js <target_url> <referrer_url> [--runs=N] [--forever] [--interval=ms] [--fixed-instances=N] --confirm-owned');
+    process.exit(1);
+  }
+  if (!cfg.confirmOwned) {
+    console.error('ERROR: This script requires --confirm-owned. Only run on domains you own or have permission to test.');
+    process.exit(1);
+  }
+
+  const targetHost = new URL(cfg.target).hostname;
+  console.log(`Starting repeatable tester — target: ${cfg.target}, referrer: ${cfg.referrer}`);
+  console.log(`Runs: ${cfg.runs}${cfg.forever ? ' (forever)' : ''}, interval=${cfg.interval}ms`);
+  if (cfg.fixedInstances) console.log(`Using fixed instances: ${cfg.fixedInstances}`); else console.log(`Tabs per run: random ${cfg.minTabs}..${cfg.maxTabs}`);
+
+  let run = 0;
+  let stop = false;
+  process.on('SIGINT', () => { console.log('\nSIGINT received — stopping after current run'); stop = true; });
+  process.on('SIGTERM', () => { console.log('\nSIGTERM received — stopping after current run'); stop = true; });
+
+  while (!stop && (cfg.forever || run < cfg.runs)) {
+    run++;
+    console.log(`\n=== Run ${run} ===`);
+    // determine tab count
+    const tabs = cfg.fixedInstances ? cfg.fixedInstances : rand(cfg.minTabs, cfg.maxTabs);
+    const profileDir = path.join('/tmp', `testbot_profile_${Date.now()}`);
+    const browser = await puppeteer.launch({
+      headless: !!cfg.headless,
+      userDataDir: profileDir,
+      defaultViewport: null,
+      args: ['--no-sandbox','--disable-setuid-sandbox']
+    });
+
+    try {
+      const flows = [];
+      for (let t = 0; t < tabs; t++) {
+        const flow = (async (tabIndex) => {
+          const page = await browser.newPage();
+          const ua = UA_LIST[rand(0, UA_LIST.length-1)];
+          const vp = VIEWPORTS[rand(0, VIEWPORTS.length-1)];
+          await page.setUserAgent(ua);
+          await page.setViewport({ width: vp.width, height: vp.height });
+          await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
+          if (cfg.debug) {
+            page.on('console', msg => console.log(`page[${tabIndex}] console:`, msg.text && msg.text()));
+            page.on('pageerror', e => console.log(`page[${tabIndex}] error:`, e.message));
+          }
+
+          const start = Date.now();
+          let refClicked = false;
+          try {
+            // 1) open referrer
+            await page.goto(cfg.referrer, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(err => {
+              if (cfg.debug) console.warn(`tab[${tabIndex}] referrer goto failed: ${err && err.message}`);
+            });
+
+            // 2) wait 1-2 min on referrer with micro actions
+            await waitOnReferrer(page, cfg.minRefWait, cfg.maxRefWait, cfg.debug);
+
+            // 3) attempt click to target
+            refClicked = await clickLinkToTarget(page, targetHost, cfg.debug);
+            if (refClicked) {
+              try { await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }); } catch (_) {}
+            } else {
+              // fallback navigate with referrer header
+              try { await page.goto(cfg.target, { waitUntil: 'domcontentloaded', timeout: 60000, referer: cfg.referrer }); } catch (err) {
+                if (cfg.debug) console.warn(`tab[${tabIndex}] fallback goto error: ${err && err.message}`);
+                await page.goto(cfg.target, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
+              }
+            }
+
+            // 4) on target homepage: partial scroll + wait 1..4.5 min
+            await partialRandomScroll(page);
+            const waitHome = rand(cfg.minTargetWait, cfg.maxTargetWait);
+            if (cfg.debug) console.log(`tab[${tabIndex}] waiting on homepage ~${Math.round(waitHome/1000)}s`);
+            const sHome = Date.now();
+            while (Date.now() - sHome < waitHome) {
+              await microMouse(page, rand(3,8));
+              await sleep(rand(2000, 8000));
+            }
+
+            // 5) click random internal post and wait 1..4.5 min
+            const postResult = await openRandomInternalPostAndWait(page, targetHost, cfg.minTargetWait, cfg.maxTargetWait, cfg.debug);
+
+            // optional screenshot
+            if (cfg.screenshot) {
+              try {
+                const shotPath = path.join(process.cwd(), `shot_run${run}_tab${tabIndex}_${Date.now()}.png`);
+                await page.screenshot({ path: shotPath, fullPage: false }).catch(()=>{});
+              } catch(_) {}
+            }
+
+            const finalUrl = await page.url().catch(()=>cfg.target);
+            const duration = Date.now() - start;
+            appendCSV([new Date().toISOString(), run, `tab${tabIndex}`, refClicked ? 'yes' : 'no', finalUrl, postResult.opened ? 'yes' : 'no', postResult.finalUrl || '', duration]);
+            await page.close().catch(()=>{});
+            return { tab: tabIndex, clicked: refClicked, finalUrl: finalUrl, postOpened: postResult.opened };
+          } catch (e) {
+            if (cfg.debug) console.error(`tab[${tabIndex}] flow error:`, e && (e.message || e));
+            try { await page.close(); } catch(_) {}
+            return { tab: tabIndex, clicked: refClicked, finalUrl: null, postOpened: false };
+          }
+        })(t+1);
+        flows.push(flow);
+        await sleep(rand(300, 1200)); // stagger tab starts
+      }
+
+      // wait all flows
+      const results = await Promise.allSettled(flows);
+      results.forEach((r) => {
+        if (r.status === 'fulfilled') {
+          const v = r.value;
+          console.log(` - tab${v.tab}: clicked=${v.clicked} postOpened=${v.postOpened} url=${v.finalUrl}`);
+        } else {
+          console.log(' - tab failed:', r.reason);
+        }
+      });
+
+    } catch (e) {
+      console.error('Run-level error:', e && e.message ? e.message : e);
+    } finally {
+      try { await browser.close(); } catch(_) {}
+      try { if (fs.existsSync(profileDir)) fs.rmSync(profileDir, { recursive: true, force: true }); } catch(_) {}
+    }
+
+    if (cfg.forever) {
+      if (stop) break;
+      console.log(`Waiting ${cfg.interval}ms before next run...`);
+      await sleep(cfg.interval);
+    } else {
+      if (run >= cfg.runs) break;
+      console.log(`Waiting ${cfg.interval}ms before next run...`);
+      await sleep(cfg.interval);
+    }
+  }
+
+  console.log('All runs complete. See sessions_log.csv for details.');
+  process.exit(0);
 })();
