@@ -16,7 +16,7 @@
  *   node testbot.js <target_url> <referrer_url> [options] --confirm-owned
  *
  * Example:
- *   node testbot.js https://learnwithblog.xyz https://x.com/GhostReacondev/status/1981679871513575623 \
+ *   node testbot.js https://learnblogs.online https://x.com/GhostReacondev/status/2024921591520641247?s=20
  *     --runs=5 --interval=30000 --confirm-owned
  *
  * IMPORTANT: Only run on domains you OWN or have explicit written permission to test.
